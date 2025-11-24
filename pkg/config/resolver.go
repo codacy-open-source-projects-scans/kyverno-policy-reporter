@@ -14,7 +14,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/openreports/reports-api/pkg/client/clientset/versioned"
 	"github.com/openreports/reports-api/pkg/client/clientset/versioned/typed/openreports.io/v1alpha1"
-	gocache "github.com/patrickmn/go-cache"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect"
 	mail "github.com/xhit/go-simple-mail/v2"
@@ -25,6 +24,7 @@ import (
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
+	gocache "zgo.at/zcache/v2"
 
 	"github.com/kyverno/policy-reporter/pkg/api"
 	"github.com/kyverno/policy-reporter/pkg/cache"
@@ -201,25 +201,36 @@ func (r *Resolver) EventPublisher() report.EventPublisher {
 	return r.publisher
 }
 
-func (r *Resolver) CustomIDGenerators() map[string]result.IDGenerator {
-	generators := make(map[string]result.IDGenerator)
+func (r *Resolver) ReconditionerConfigs() map[string]result.ReconditionerConfig {
+	configs := make(map[string]result.ReconditionerConfig)
 	for _, c := range r.config.SourceConfig {
-		if !c.Enabled || len(c.Fields) == 0 {
+		var generator result.IDGenerator
+		if c.CustomID.Enabled && len(c.CustomID.Fields) > 0 {
+			generator = result.NewIDGenerator(c.CustomID.Fields)
+		}
+
+		if generator == nil && !c.SelfassignNamespaces {
 			continue
 		}
 
 		if len(c.Selector.Sources) > 0 {
 			for _, source := range c.Selector.Sources {
-				generators[strings.ToLower(source)] = result.NewIDGenerator(c.Fields)
+				configs[strings.ToLower(source)] = result.ReconditionerConfig{
+					IDGenerators:         generator,
+					SelfassignNamespaces: c.SelfassignNamespaces,
+				}
 			}
 
 			continue
 		}
 
-		generators[strings.ToLower(c.Selector.Source)] = result.NewIDGenerator(c.Fields)
+		configs[strings.ToLower(c.Selector.Source)] = result.ReconditionerConfig{
+			IDGenerators:         generator,
+			SelfassignNamespaces: c.SelfassignNamespaces,
+		}
 	}
 
-	return generators
+	return configs
 }
 
 // EventPublisher resolver method
@@ -255,7 +266,7 @@ func (r *Resolver) WGPolicyQueue() (*wgpolicyclient.WGPolicyQueue, error) {
 				DisableClusterReports: f.DisableClusterReports,
 			}
 		})),
-		result.NewReconditioner(r.CustomIDGenerators()),
+		result.NewReconditioner(r.ReconditionerConfigs()),
 	), nil
 }
 
@@ -291,7 +302,7 @@ func (r *Resolver) ORQueue() (*orclient.ORQueue, error) {
 				DisableClusterReports: f.DisableClusterReports,
 			}
 		})),
-		result.NewReconditioner(r.CustomIDGenerators()),
+		result.NewReconditioner(r.ReconditionerConfigs()),
 	), nil
 }
 
@@ -391,7 +402,7 @@ func (r *Resolver) NamespaceClient() (namespaces.Client, error) {
 
 	return namespaces.NewClient(
 		clientset.CoreV1().Namespaces(),
-		gocache.New(15*time.Second, 5*time.Second),
+		gocache.New[string, []string](15*time.Second, 5*time.Second),
 	), nil
 }
 
@@ -724,7 +735,7 @@ func (r *Resolver) OpenReportsClient() (report.PolicyReportClient, error) {
 
 	_, err = discoveryClient.ServerResourcesForGroupVersion(orclient.OpenreportsReport.GroupVersion().String())
 	if err != nil {
-		zap.L().Info("openreports api not available in the cluster", zap.Error(err))
+		zap.L().Info("openreports api not available in the cluster", zap.String("reason", err.Error()))
 		return nil, nil
 	}
 
@@ -775,7 +786,7 @@ func (r *Resolver) ResultCache() cache.Cache {
 			6*time.Hour,
 		)
 	} else {
-		r.resultCache = cache.NewInMermoryCache(6*time.Hour, 10*time.Minute)
+		r.resultCache = cache.NewInMemoryCache(6*time.Hour, 10*time.Minute)
 	}
 
 	return r.resultCache
